@@ -1,0 +1,25 @@
+# Virtual environments 
+V2_EMG_adapt/ 
+
+# Python 
+__pycache__/
+*.py[cod]
+
+# Jupyter
+.ipynb_checkpoints/
+
+# VS Code
+.vscode/
+
+# Large/generated files
+*.pkl
+*.h5
+*.keras
+*.csv
+*.pt
+
+# Figures 
+plots/
+
+# Test Results 
+FSL_single_subject/ 
