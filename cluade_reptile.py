@@ -614,5 +614,21 @@ def seed_sweep(seeds=(0, 1, 2, 3)):
     print(f"saved seed sweep -> results_seed_sweep_{stamp}.csv")
     return summary
 
+def save_deployment_embedding(seed=0, save_path="deployment_embedding.pt"):
+    """Train ONE embedding on ALL subjects' base gestures (lambda=0) and save it
+    for live deployment (enroll.py / recognize.py)."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    X, y, reps, subj = load_subject_gestures(SUBJECTS, EXERCISES)
+    base_classes, _ = split_base_novel(y, n_novel=N_NOVEL, seed=seed)
+    Xb, yb = make_base_dataset(X, y, base_classes)
+    e = X.shape[1]
+    model = pretrain_embedding(Xb, yb, len(base_classes), e,
+                               PRETRAIN_EPOCHS, PRETRAIN_LR, PRETRAIN_LAMBDA, 256, device)
+    torch.save(model.state_dict(), save_path)
+    print(f"saved deployment embedding (e={e}, {len(base_classes)} base classes, "
+          f"all {len(set(subj.tolist()))} subjects) -> {save_path}")
+    return save_path
+
 if __name__ == "__main__":
-    seed_sweep(seeds=(0, 1, 2, 3))
+    #seed_sweep(seeds=(0, 1, 2, 3))
+    save_deployment_embedding(seed=0)
