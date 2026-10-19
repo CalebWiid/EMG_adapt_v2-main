@@ -8,14 +8,14 @@ IDEA
   whose embedding places UNSEEN gestures well from few examples.
 
 PROTOCOL
-  * Meta-training tasks are sampled ONLY from the 40 BASE gestures (5-way, 5-shot).
+  * Meta-training tasks are sampled ONLY from the 40 BASE gestures.
   * The 12 NOVEL gestures are held out and used only for evaluation
     (12-way, 3-rep enrollment) - identical to the Piece-2 baseline, so the number
     is directly comparable to that ~0.78 pooled baseline.
 
 REPTILE (first-order):
   each meta-iteration m:
-    1. sample a task (5 base gestures, 5 support windows each)
+    1. sample a task 
     2. clone the model -> inner-adapt it with the hybrid loss for `inner_steps` steps
     3. move the global weights toward the adapted weights:  theta <- theta + beta*(theta' - theta)
        with step-size decay  beta = (1 - m/M) * s     (paper Eq. 11 / Eq. 12)

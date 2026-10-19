@@ -17,6 +17,9 @@ What makes the live data match the DB5 training data:
   5. ONE PREDICTION = ONE 3 s CAPTURE. Live, the capture starts when "p" is
      pressed; offline, it starts at the HOLD cue. Both are cut and filtered by
      the same function (capture_features), so they are processed identically.
+  6. CALIBRATION after putting the band back on: estimate_rotation finds how far
+     the band has turned since enrollment (and the change in signal level);
+     capture_features turns every capture back by that amount.
 """
 import os
 import sys
@@ -43,7 +46,7 @@ REST_LABEL = "rest"
 REFERENCE_PATH = "db5_reference.npz"   # written by Check_embedding.py
 RECORDINGS_DIR = "recordings"          # raw enrollment sessions are saved here
 
-CAPTURE_S = 3.0      # one prediction = this much signal (live: after pressing "p")
+CAPTURE_S = 5.0      # one prediction = this much signal (live: after pressing "p")
 PREROLL_S = 2.0      # signal from just before the capture, filtered together with it
 
 
@@ -140,15 +143,88 @@ def cut_capture(emg, start, end, fs, preroll_s=PREROLL_S):
     return emg[p0:end], end - start
 
 
-def capture_features(raw, capture_n, fs_in=DEVICE_FS, resample=True):
+def capture_features(raw, capture_n, fs_in=DEVICE_FS, resample=True, rotation=0.0):
     """CCA features of one capture, processed identically live and offline.
 
     raw = pre-roll followed by the capture (raw device samples); the capture is
     its last capture_n samples. The whole piece is filtered as one, then only the
-    windows lying fully inside the capture are kept."""
+    windows lying fully inside the capture are kept. `rotation` (in channels,
+    from calibration) turns the band back to its enrollment position."""
     filt, fs = filter_recording(raw, fs_in, resample=resample)
+    filt = rotate_channels(filt, rotation)
     start = convert_index(len(raw) - capture_n, fs_in, fs)
     return interval_features(filt, fs, start, filt.shape[0])
+
+
+# --------------------------------------------------------------------------- #
+# Calibration after putting the band back on (rotation + amplitude level)
+# --------------------------------------------------------------------------- #
+def rotate_channels(x, r):
+    """Turn the electrode ring by r channels (fractional allowed) on a filtered
+    envelope (..., 8): output channel c = the signal at ring position c + r,
+    linearly interpolated between the two nearest electrodes. Assumes the 8
+    electrodes are evenly spaced around a closed ring, in channel order."""
+    if abs(r) < 1e-9:
+        return x
+    n = x.shape[-1]
+    k = int(np.floor(r))
+    a = r - k
+    lo = np.roll(x, -k, axis=-1)                  # lo[..., c] = x[..., c + k]
+    hi = np.roll(x, -(k + 1), axis=-1)            # hi[..., c] = x[..., c + k + 1]
+    return (1 - a) * lo + a * hi
+
+
+def mean_pattern(filt, fs, intervals):
+    """Mean CCA feature vector (8,) over the windows of the given intervals
+    [(start, end) at fs] of a filtered recording."""
+    feats = [interval_features(filt, fs, s, e) for s, e in intervals]
+    feats = [f for f in feats if len(f)]
+    return np.concatenate(feats).mean(0) if feats else None
+
+
+def enrollment_reference(session_dir, gesture_names, reps, hold_trim):
+    """{gesture: mean CCA feature vector (8,)} of the enrollment session, from the
+    same reps and trimmed holds the prototypes were built from (no offset)."""
+    gestures, _ = session_features(session_dir, gesture_names, hold_trim, 0.0)
+    ref = {}
+    for g, by_rep in gestures.items():
+        f = [by_rep[r] for r in reps if r in by_rep and len(by_rep[r])]
+        if f:
+            ref[g] = np.concatenate(f).mean(0)
+    return ref
+
+
+def estimate_rotation(recordings, ref, hold_trim, max_rot=0.5, step=0.05):
+    """Find the band rotation that best matches the enrollment.
+
+    recordings: {gesture: (raw emg 500 Hz, [(start, end) of each hold at 500 Hz])}
+    ref:        {gesture: (8,) enrollment mean pattern} from enrollment_reference
+    Patterns are compared after removing each one's mean over the 8 channels, so a
+    change in overall signal level does not affect the rotation estimate.
+    Returns (rotation in channels, level change to add to the offset, costs)."""
+    filt = {}
+    for g, (emg, holds) in recordings.items():
+        f, fs = filter_recording(emg)
+        iv = [trimmed(convert_index(s, DEVICE_FS, fs), convert_index(e, DEVICE_FS, fs),
+                      hold_trim, fs) for s, e in holds]
+        filt[g] = (f, fs, iv)
+    names = [g for g in recordings if g in ref]
+    if not names:
+        raise ValueError("no calibration gesture has an enrollment reference")
+    B = np.stack([ref[g] for g in names])
+    B0 = B - B.mean(1, keepdims=True)
+
+    candidates = np.round(np.arange(-max_rot, max_rot + step / 2, step), 6)
+    costs, best = [], None
+    for r in candidates:
+        A = np.stack([mean_pattern(rotate_channels(f, r), fs, iv)
+                      for f, fs, iv in (filt[g] for g in names)])
+        A0 = A - A.mean(1, keepdims=True)
+        cost = float(((A0 - B0) ** 2).mean())
+        costs.append(cost)
+        if best is None or cost < best[1]:
+            best = (float(r), cost, float((B - A).mean()))
+    return best[0], best[2], dict(zip(candidates.tolist(), costs))
 
 
 def classify_features(model, feats, offset, labels, protos, device=None):
