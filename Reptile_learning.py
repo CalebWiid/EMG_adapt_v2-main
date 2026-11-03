@@ -632,8 +632,43 @@ def save_deployment_embedding(seed=0, save_path="deployment_embedding.pt"):
           f"all {len(set(subj.tolist()))} subjects) -> {save_path}")
     return save_path
 
+def save_reptile_deployment_embedding(seed=0, start_path="deployment_embedding.pt",
+                                      save_path="deployment_embedding_reptile.pt",
+                                      inner_lr=3e-4, inner_steps=2):
+    """Phase 2 only: meta-train the existing supervised deployment embedding on ALL
+    subjects' base gestures with the tuned settings, and save it for live use."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(seed)
+    X, y, reps, subj = load_subject_gestures(SUBJECTS, EXERCISES)
+    base_classes, _ = split_base_novel(y, n_novel=N_NOVEL, seed=seed)
+    e = X.shape[1]
+
+    # start from the SAME supervised embedding the live system uses
+    pretrained = EMGAdapt(e=e, n_classes=len(base_classes))
+    pretrained.load_state_dict(torch.load(start_path, map_location=device))
+    model = EMGAdapt(e=e, n_classes=N_WAY).to(device)
+    model.features.load_state_dict(pretrained.features.state_dict())
+    model.embedding.load_state_dict(pretrained.embedding.state_dict())
+    if FREEZE_FEATURES:
+        for p_ in model.features.parameters():
+            p_.requires_grad_(False)
+
+    bm = np.isin(y, base_classes)
+    sampler = TaskSampler(X[bm], y[bm], reps[bm], subj[bm], base_classes,
+                          N_WAY, K_SHOT, seed=seed)
+    no_eval = lambda mdl: {"window_acc": float("nan"), "pooled_acc": float("nan")}
+    model, _ = reptile_train(model, sampler, no_eval, meta_iters=META_ITERS,
+                             inner_steps=inner_steps, inner_lr=inner_lr,
+                             step_size=STEP_SIZE, n_way=N_WAY, lambda_=LAMBDA,
+                             eval_every=META_ITERS, freeze_features=FREEZE_FEATURES,
+                             device=device)
+    torch.save(model.state_dict(), save_path)
+    print(f"saved Reptile deployment embedding (from {start_path}, inner_lr={inner_lr}, "
+          f"inner_steps={inner_steps}) -> {save_path}")
+    return save_path
+
 if __name__ == "__main__":
-    #seed_sweep(seeds=(0, 1, 2, 3))
     #save_deployment_embedding(seed=0)
     #run_crossval(seed=TUNE_SEED)
-    seed_sweep(seeds=REPORT_SEEDS)
+    #seed_sweep(seeds=REPORT_SEEDS)
+    save_reptile_deployment_embedding(seed=0) 

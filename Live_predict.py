@@ -6,6 +6,16 @@ Three modes:
   python Live_predict.py --test                cued live test (measures accuracy)
   python Live_predict.py --replay <folder>     re-score a saved test, no armband
 
+MODEL. Common.ACTIVE_MODEL is used unless --model is given (any mode):
+  python Live_predict.py --test --model supervised
+  python Live_predict.py --replay <folder> --model reptile
+Each model has its own prototype file (Common.MODELS); the script stops if the
+prototypes were built with a different embedding. --protos-dir <folder> reads the
+prototype files from another folder, e.g. ones made with
+Enroll.py --rebuild <session> --out <folder>, to replay an old test against the
+enrollment it was recorded with:
+  python Live_predict.py --replay live_tests/<test> --model reptile --protos-dir <folder>
+
 PREDICTION (same in every mode):
   * The armband streams the whole time, but nothing is classified until "p".
   * Press "p", then perform the gesture. The next CAPTURE_S (5 s) of signal is
@@ -23,6 +33,7 @@ relaxed) for the whole capture. "q" stops early; the completed trials are still 
 A trial is correct when the prediction equals the cue, so the results are
 directly comparable with Offline_eval.py version C, "with rest class".
 Saved to live_tests/<date_time>/: captures.npz (for replay), trials.csv, summary.txt.
+The model used is recorded in captures.npz and summary.txt.
 
 CALIBRATION (runs first in free use and --test). With CALIBRATE = "ask" the
 script asks at start-up: [c] calibrate or [s] skip. Command-line flags decide
@@ -39,13 +50,14 @@ are estimated:
   * level: the change in overall signal level since enrollment (skin contact),
     added to the amplitude offset (CAL_LEVEL = True).
 The prototypes are NOT changed: calibration only aligns new data to them.
+Calibration does not depend on the model.
 With --test the calibration recording and result are saved in calibration.npz.
 
-REPLAY (--replay) re-classifies the saved captures with the CURRENT prototypes
-and the calibration saved with the test, and saves the result in a
-replay_<date_time> subfolder. Add --no-cal to score the same captures without
-calibration (rotation 0, enrollment offset): the difference is what the
-calibration contributed.
+REPLAY (--replay) re-classifies the saved captures with the chosen model's
+CURRENT prototypes and the calibration saved with the test, and saves the result
+in a replay_<model>_<date_time> subfolder. Add --no-cal to score the same
+captures without calibration (rotation 0, enrollment offset): the difference is
+what the calibration contributed.
   python Live_predict.py --replay <folder> --no-cal
 """
 import os
@@ -58,10 +70,8 @@ from collections import Counter
 import numpy as np
 import torch
 import Common as lc
+from stream import LiveBoard          # live window of the raw EMG
 from Enroll import (record_protocol, GESTURE_NAMES, ENROLL_REPS, HOLD_TRIM_S)
-
-MODEL_PATH = "deployment_embedding.pt"
-PROTO_PATH = "prototypes.npz"
 
 START_KEY = "p"          # press to start a capture
 QUIT_KEY = "q"
@@ -90,12 +100,20 @@ CAL_LEVEL = True         # also correct the overall signal level (offset)
 
 
 class Predictor:
-    """Embedding model + prototypes: one capture in, one prediction out."""
+    """Embedding model + its prototypes: one capture in, one prediction out."""
 
-    def __init__(self, device=None):
+    def __init__(self, model_name=None, proto_dir="", device=None):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model = lc.load_embedding(MODEL_PATH, device=self.device)
-        self.labels, self.protos, self.offset = lc.load_prototypes(PROTO_PATH)
+        self.model_name = model_name or lc.ACTIVE_MODEL
+        self.model_path, self.proto_path = lc.model_paths(self.model_name, proto_dir)
+        if not os.path.exists(self.proto_path):
+            raise SystemExit(f"No prototypes for model '{self.model_name}' "
+                             f"({self.proto_path} not found). Run Enroll.py, or "
+                             f"Enroll.py --rebuild to build them from a saved session.")
+        lc.check_pair(self.model_path, self.proto_path)
+        self.model = lc.load_embedding(self.model_path, device=self.device)
+        self.labels, self.protos, self.offset = lc.load_prototypes(self.proto_path)
+        self.session_dir = lc.prototype_info(self.proto_path)["session_dir"]
         self.offset_enroll = self.offset       # as stored by Enroll.py
         self.rotation = 0.0                    # set by calibration
         self.calibrated = False
@@ -119,13 +137,12 @@ class Predictor:
 # --------------------------------------------------------------------------- #
 # Calibration
 # --------------------------------------------------------------------------- #
-def enrollment_session():
-    """The recording folder the stored prototypes were built from."""
-    d = np.load(PROTO_PATH, allow_pickle=True)
-    session = str(d["session_dir"]) if "session_dir" in d.files else ""
+def enrollment_session(pred):
+    """The recording folder the loaded prototypes were built from."""
+    session = pred.session_dir
     if not session or not os.path.isdir(session):
         raise SystemExit(f"Calibration needs the enrollment recordings, but "
-                         f"'{session}' (named in {PROTO_PATH}) was not found. "
+                         f"'{session}' (named in {pred.proto_path}) was not found. "
                          f"Set CALIBRATE = False to run without calibration.")
     return session
 
@@ -161,7 +178,7 @@ def want_calibration(argv):
 def calibrate(board, pred):
     """Record the calibration gestures, estimate rotation + level, apply them to
     `pred`. Returns a dict with the result and the raw recordings."""
-    session = enrollment_session()
+    session = enrollment_session(pred)
     ref = lc.enrollment_reference(session, GESTURE_NAMES, ENROLL_REPS, HOLD_TRIM_S)
     gestures = pick_cal_gestures(ref, N_CAL_GESTURES)
     print(f"\nCALIBRATION - {len(gestures)} gestures, {CAL_REPS} x 5 s hold each: "
@@ -276,19 +293,21 @@ def cue_text(cue):
     return "STAY RELAXED" if cue == lc.REST_LABEL else f"PERFORM {cue}"
 
 
+def describe_model(pred):
+    print(f"model: {pred.model_name}  ({pred.model_path}, prototypes {pred.proto_path})")
+
+
 # --------------------------------------------------------------------------- #
 # Mode 1: free use
 # --------------------------------------------------------------------------- #
-def run_free(do_cal=None):
-    if not os.path.exists(PROTO_PATH):
-        print(f"No gestures enrolled yet ({PROTO_PATH} not found). Run Enroll.py first.")
-        return
-    pred = Predictor()
+def run_free(model_name=None, proto_dir="", do_cal=None):
+    pred = Predictor(model_name, proto_dir)
     do_cal = want_calibration(sys.argv) if do_cal is None else do_cal
+    describe_model(pred)
     print(f"loaded {len(pred.labels)} classes: {pred.labels}")
     print(f"amplitude offset {pred.offset:+.4f}")
 
-    board = lc.connect_board()
+    board = LiveBoard(lc.connect_board(), "Live_predict - raw EMG")
     try:
         if do_cal:
             calibrate(board, pred)
@@ -358,17 +377,23 @@ def format_summary(rows, s, labels):
     return "\n".join(out)
 
 
-def settings_text(pred):
+def settings_text(pred, capture_s=None, preroll_s=None):
+    """capture_s / preroll_s: those of the captures being scored (default: current)."""
+    capture_s = lc.CAPTURE_S if capture_s is None else capture_s
+    preroll_s = lc.PREROLL_S if preroll_s is None else preroll_s
     cal = (f"calibrated: rotation={pred.rotation:+.2f} offset={pred.offset:+.4f} "
            f"(enrollment {pred.offset_enroll:+.4f})" if pred.calibrated else
            f"not calibrated: offset={pred.offset:+.4f} (enrollment)")
-    return (f"settings: capture_s={lc.CAPTURE_S} preroll_s={lc.PREROLL_S} "
-            f"prototypes={PROTO_PATH}\n{cal}")
+    return (f"model: {pred.model_name}  weights={pred.model_path}  "
+            f"prototypes={pred.proto_path}\n"
+            f"enrollment session: {pred.session_dir}\n"
+            f"settings: capture_s={capture_s} preroll_s={preroll_s}\n{cal}")
 
 
-def report(folder, pred, cues, results):
+def report(folder, pred, cues, results, capture_s=None, preroll_s=None):
     rows, summary = score(cues, results)
-    text = settings_text(pred) + "\n\n" + format_summary(rows, summary, pred.labels)
+    text = (settings_text(pred, capture_s, preroll_s) + "\n\n"
+            + format_summary(rows, summary, pred.labels))
     print("\n" + text)
     with open(os.path.join(folder, "trials.csv"), "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
@@ -390,26 +415,26 @@ def make_trials(labels, rng):
 
 
 def save_captures(folder, segments, capture_ns, cues, results, pred):
-    """Every capture (pre-roll + capture, raw 500 Hz) end to end, plus the
-    calibration that was applied, so --replay can re-classify exactly the same
-    signal with or without it."""
+    """Every capture (pre-roll + capture, raw 500 Hz) end to end, plus the model
+    and calibration that were used, so --replay can re-classify exactly the same
+    signal with either model, with or without calibration."""
     np.savez(os.path.join(folder, "captures.npz"),
              emg=np.concatenate(segments),
              seg_ends=np.cumsum([len(s) for s in segments]),
              capture_n=np.array(capture_ns), cues=np.array(cues),
              live_pred=np.array([str(p) for p, _ in results]),
              live_vote=np.array([f for _, f in results]),
+             model=np.array(pred.model_name), model_path=np.array(pred.model_path),
+             session_dir=np.array(pred.session_dir),
              calibrated=pred.calibrated, rotation=pred.rotation, offset_used=pred.offset,
              offset_enroll=pred.offset_enroll,
              fs=lc.DEVICE_FS, capture_s=lc.CAPTURE_S, preroll_s=lc.PREROLL_S)
 
 
-def run_test(do_cal=None):
-    if not os.path.exists(PROTO_PATH):
-        print(f"No gestures enrolled yet ({PROTO_PATH} not found). Run Enroll.py first.")
-        return
-    pred = Predictor()
+def run_test(model_name=None, proto_dir="", do_cal=None):
+    pred = Predictor(model_name, proto_dir)
     do_cal = want_calibration(sys.argv) if do_cal is None else do_cal
+    describe_model(pred)
     trials = make_trials(pred.labels, np.random.default_rng(SEED))
     print(f"{len(trials)} trials ({TRIALS_PER_GESTURE} per gesture + {REST_TRIALS} rest).")
     print(f"For each trial: read the cue, press [{START_KEY}], then perform it for "
@@ -419,7 +444,7 @@ def run_test(do_cal=None):
     os.makedirs(folder, exist_ok=True)
     segments, capture_ns, cues, results = [], [], [], []
 
-    board = lc.connect_board()
+    board = LiveBoard(lc.connect_board(), "Live_predict - raw EMG")
     try:
         if do_cal:
             cal = calibrate(board, pred)
@@ -456,13 +481,25 @@ def run_test(do_cal=None):
 # --------------------------------------------------------------------------- #
 # Mode 3: replay a saved test with the current prototypes (--replay)
 # --------------------------------------------------------------------------- #
-def replay(folder, use_cal=True):
+def replay(folder, use_cal=True, model_name=None, proto_dir=""):
     d = np.load(os.path.join(folder, "captures.npz"), allow_pickle=True)
-    pred = Predictor()
+    pred = Predictor(model_name, proto_dir)
+    used = str(d["model"]) if "model" in d.files else f"{lc.LEGACY_MODEL} (not recorded)"
+    print(f"live test used model: {used}   replaying with: {pred.model_name}")
+
+    # are these prototypes from the enrollment this test was run against?
+    test_session = str(d["session_dir"]) if "session_dir" in d.files else ""
+    saved_offset = next((float(d[k]) for k in ("offset_enroll", "offset")
+                         if k in d.files), None)
+    if test_session:
+        if os.path.normpath(test_session) != os.path.normpath(pred.session_dir):
+            print(f"  note: this test used the enrollment {test_session}, "
+                  f"but the prototypes come from {pred.session_dir}")
+    elif saved_offset is not None and not np.isclose(saved_offset, pred.offset_enroll):
+        print("  note: the prototypes are not from the enrollment this test used "
+              f"(enrollment offset {saved_offset:+.4f} vs {pred.offset_enroll:+.4f})")
+
     if use_cal and "rotation" in d.files and bool(d["calibrated"] if "calibrated" in d.files else True):
-        if not np.isclose(float(d["offset_enroll"]), pred.offset_enroll):
-            print("  note: the current prototypes are not the ones this test used "
-                  "(different enrollment offset)")
         pred.set_calibration(float(d["rotation"]),
                              float(d["offset_used"]) - float(d["offset_enroll"]))
     emg, ends = d["emg"], d["seg_ends"]
@@ -470,20 +507,29 @@ def replay(folder, use_cal=True):
     cues = [str(c) for c in d["cues"]]
     results = [pred.predict(emg[s:e], int(n))[:2]
                for s, e, n in zip(starts, ends, d["capture_n"])]
-    tag = "replay_" if use_cal else "replay_nocal_"
+    tag = f"replay_{pred.model_name}_" if use_cal else f"replay_nocal_{pred.model_name}_"
     out = os.path.join(folder, tag + datetime.now().strftime("%Y%m%d_%H%M%S"))
     os.makedirs(out, exist_ok=True)
-    print(f"replaying {folder} with the current prototypes, "
+    print(f"replaying {folder} with the current '{pred.model_name}' prototypes, "
           f"{'with the saved calibration' if use_cal else 'WITHOUT calibration'}")
-    report(out, pred, cues, results)
+    capture_s = float(d["capture_s"]) if "capture_s" in d.files else None
+    preroll_s = float(d["preroll_s"]) if "preroll_s" in d.files else None
+    report(out, pred, cues, results, capture_s, preroll_s)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--test":
-        run_test()
-    elif len(sys.argv) > 2 and sys.argv[1] == "--replay":
-        replay(sys.argv[2], use_cal="--no-cal" not in sys.argv[3:])
-    elif len(sys.argv) > 1:
+    args = sys.argv[1:]
+    model = lc.arg_value(args, "--model")
+    proto_dir = lc.arg_value(args, "--protos-dir", "")
+    if args and args[0] == "--test":
+        run_test(model, proto_dir)
+    elif args and args[0] == "--replay":
+        if len(args) < 2 or args[1].startswith("--"):
+            raise SystemExit("usage: python Live_predict.py --replay <folder> "
+                             "[--model NAME] [--protos-dir DIR] [--no-cal]")
+        replay(args[1], use_cal="--no-cal" not in args, model_name=model,
+               proto_dir=proto_dir)
+    elif args and args[0] not in ("--model", "--protos-dir", "--cal", "--skip-cal"):
         print(__doc__.split("PREDICTION")[0])
     else:
-        run_free()
+        run_free(model, proto_dir)

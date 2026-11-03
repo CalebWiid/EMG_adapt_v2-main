@@ -14,12 +14,16 @@ What makes the live data match the DB5 training data:
      per-user offset (computed at enrollment) moves the user's features onto the
      DB5 scale. The DB5 reference comes from Check_embedding.py.
   4. CLASSIFY BY MAJORITY VOTE over windows, as in the offline evaluation.
-  5. ONE PREDICTION = ONE 3 s CAPTURE. Live, the capture starts when "p" is
-     pressed; offline, it starts at the HOLD cue. Both are cut and filtered by
+  5. ONE PREDICTION = ONE CAPTURE (CAPTURE_S). Live, the capture starts when "p"
+     is pressed; offline, it starts at the HOLD cue. Both are cut and filtered by
      the same function (capture_features), so they are processed identically.
   6. CALIBRATION after putting the band back on: estimate_rotation finds how far
      the band has turned since enrollment (and the change in signal level);
      capture_features turns every capture back by that amount.
+  7. MODEL CHOICE: MODELS pairs each embedding (supervised, reptile) with the
+     prototype file built with it. ACTIVE_MODEL is used unless a script is told
+     otherwise (--model). Every prototype file stores which embedding built it,
+     and check_pair refuses to classify with a mismatched pair.
 """
 import os
 import sys
@@ -48,6 +52,18 @@ RECORDINGS_DIR = "recordings"          # raw enrollment sessions are saved here
 
 CAPTURE_S = 5.0      # one prediction = this much signal (live: after pressing "p")
 PREROLL_S = 2.0      # signal from just before the capture, filtered together with it
+
+# --------------------------------------------------------------------------- #
+# Models: every embedding is paired with the prototype file built with it
+# --------------------------------------------------------------------------- #
+MODELS = {
+    "supervised": {"weights": "deployment_embedding.pt",
+                   "protos": "prototypes.npz"},
+    "reptile":    {"weights": "deployment_embedding_reptile.pt",
+                   "protos": "prototypes_reptile.npz"},
+}
+ACTIVE_MODEL = "reptile"        # used unless a script is given --model
+LEGACY_MODEL = "supervised"     # prototype files saved before the model was stored
 
 
 # --------------------------------------------------------------------------- #
@@ -132,7 +148,7 @@ def trimmed(start, end, trim, fs):
 
 
 # --------------------------------------------------------------------------- #
-# 3 s captures (live prediction, and the identical offline test)
+# Captures (live prediction, and the identical offline test)
 # --------------------------------------------------------------------------- #
 def cut_capture(emg, start, end, fs, preroll_s=PREROLL_S):
     """From a longer raw recording: (pre-roll + capture, capture length).
@@ -287,6 +303,40 @@ def embed_features(model, feats, device=None, batch=2048):
 
 
 # --------------------------------------------------------------------------- #
+# Model choice (which embedding + which prototype file)
+# --------------------------------------------------------------------------- #
+def model_paths(name=None, proto_dir=""):
+    """(weights path, prototype path) of a model in MODELS (default ACTIVE_MODEL).
+    proto_dir: folder holding the prototype file ("" = the working directory)."""
+    name = name or ACTIVE_MODEL
+    if name not in MODELS:
+        raise SystemExit(f"unknown model '{name}' - choose from {list(MODELS)}")
+    m = MODELS[name]
+    protos = os.path.join(proto_dir, m["protos"]) if proto_dir else m["protos"]
+    return m["weights"], protos
+
+
+def prototype_info(path):
+    """What a prototype file was built from: {'model_path', 'session_dir'}.
+    Files saved before the model was stored count as LEGACY_MODEL."""
+    d = np.load(path, allow_pickle=True)
+    model = (str(d["model_path"]) if "model_path" in d.files
+             else MODELS[LEGACY_MODEL]["weights"])
+    session = str(d["session_dir"]) if "session_dir" in d.files else ""
+    return {"model_path": model, "session_dir": session}
+
+
+def check_pair(model_path, proto_path):
+    """Stop if the prototypes were built with a different embedding than the one
+    being loaded: their distances would be meaningless, but nothing would crash."""
+    built_with = prototype_info(proto_path)["model_path"]
+    if os.path.basename(built_with) != os.path.basename(model_path):
+        raise SystemExit(f"{proto_path} was built with {built_with}, but the model "
+                         f"being loaded is {model_path}.\nRebuild the prototypes "
+                         f"(python Enroll.py --rebuild) or choose the matching model.")
+
+
+# --------------------------------------------------------------------------- #
 # Prototypes + classification
 # --------------------------------------------------------------------------- #
 def build_prototypes(embs_by_label):
@@ -318,9 +368,11 @@ def make_prototypes(model, gestures, rests, reps, reference_median=None,
     return labels, protos, offset
 
 
-def save_prototypes(path, labels, protos, offset, session_dir=""):
+def save_prototypes(path, labels, protos, offset, session_dir="", model_path=""):
+    """model_path = the embedding the prototypes were built with (checked at load)."""
     np.savez(path, labels=np.array(labels), protos=np.asarray(protos),
-             offset=np.float64(offset), session_dir=np.array(session_dir))
+             offset=np.float64(offset), session_dir=np.array(session_dir),
+             model_path=np.array(model_path))
 
 
 def load_prototypes(path):
@@ -397,6 +449,19 @@ def session_features(session_dir, gesture_names, hold_trim, rest_trim,
             rests.setdefault(rep, []).append(interval_features(filt, fs, s, e))
     rests = {r: np.concatenate(v) for r, v in rests.items()}
     return gestures, rests
+
+
+# --------------------------------------------------------------------------- #
+# Command line
+# --------------------------------------------------------------------------- #
+def arg_value(argv, flag, default=None):
+    """The value after `flag` on the command line (e.g. --model reptile), or default."""
+    if flag not in argv:
+        return default
+    i = argv.index(flag)
+    if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+        raise SystemExit(f"{flag} needs a value")
+    return argv[i + 1]
 
 
 # --------------------------------------------------------------------------- #

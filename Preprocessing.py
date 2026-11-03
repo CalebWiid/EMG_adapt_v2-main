@@ -37,7 +37,12 @@ LOG_EPS = 1e-10             #Prevents log(0)
 PHYSICAL_CHANNEL_ORDER = [1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15, 8, 16]
 
 # To mimic the Mindroves 8 channel layout, revome the second myo band 
-SELECT_CHANNELS = [1, 2, 3, 4, 5, 6, 7, 8]  
+# SELECT_CHANNELS = [1, 2, 3, 4, 5, 6, 7, 8]  
+# To mimic the EMG_adapt paper 
+# SELECT_CHANNELS = [1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15, 8, 16]
+
+# debug channel order 
+SELECT_CHANNELS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
 
 DEFAULT_FILTER_KWARGS = dict(
     lowpass_cutoff=1.0,
